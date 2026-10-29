@@ -1,7 +1,12 @@
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.IO;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -53,6 +58,7 @@ namespace Screener
     {
         readonly NotifyIcon _icon;
         readonly CaptureController _capture;
+        readonly PhoneInbox _phone;
         readonly ToolStripMenuItem _autoStart;
 
         public TrayApp()
@@ -66,14 +72,23 @@ namespace Screener
             _autoStart.Checked = AutoStart.IsEnabled();
             _autoStart.Click += delegate { ToggleAutoStart(); };
 
+            _capture = new CaptureController(_icon);
+            _capture.Start();
+            _phone = new PhoneInbox(_capture);
+
+            var address = new ToolStripMenuItem(PhoneInbox.AddressLine());
+            address.Click += delegate
+            {
+                try { Clipboard.SetText(PhoneInbox.PrimaryUrl()); }
+                catch { }
+            };
+
             var menu = new ContextMenuStrip();
+            menu.Items.Add(address);
             menu.Items.Add(_autoStart);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Выход", null, delegate { ExitThread(); });
             _icon.ContextMenuStrip = menu;
-
-            _capture = new CaptureController(_icon);
-            _capture.Start();
         }
 
         void ToggleAutoStart()
@@ -84,10 +99,187 @@ namespace Screener
 
         protected override void ExitThreadCore()
         {
+            _phone.Dispose();
             _capture.Dispose();
             _icon.Visible = false;
             _icon.Dispose();
             base.ExitThreadCore();
+        }
+    }
+
+    internal sealed class PhoneInbox : IDisposable
+    {
+        public const int Port = 47123;
+        const int MaxBytes = 25 * 1024 * 1024;
+
+        readonly CaptureController _capture;
+        readonly Form _gate;
+        readonly TcpListener _listener;
+        readonly Thread _thread;
+        volatile bool _stop;
+
+        public PhoneInbox(CaptureController capture)
+        {
+            _capture = capture;
+            _gate = new Form();
+            _gate.ShowInTaskbar = false;
+            var handle = _gate.Handle;
+            if (handle == IntPtr.Zero) throw new InvalidOperationException();
+            _listener = new TcpListener(IPAddress.Any, Port);
+            _listener.Start();
+            _thread = new Thread(Loop);
+            _thread.IsBackground = true;
+            _thread.Start();
+        }
+
+        public static string AddressLine()
+        {
+            var ip = FirstLanIp();
+            if (ip == null) return "Телефон: нет сети";
+            return "Телефон: " + ip + ":" + Port;
+        }
+
+        public static string PrimaryUrl()
+        {
+            var ip = FirstLanIp();
+            if (ip == null) return "http://127.0.0.1:" + Port + "/shot";
+            return "http://" + ip + ":" + Port + "/shot";
+        }
+
+        static IPAddress FirstLanIp()
+        {
+            IPAddress fallback = null;
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                var title = (nic.Name + " " + nic.Description).ToLowerInvariant();
+                if (title.Contains("virtual") || title.Contains("vmware") || title.Contains("hyper-v")
+                    || title.Contains("vethernet") || title.Contains("wsl") || title.Contains("docker")
+                    || title.Contains("bluetooth") || title.Contains("loopback"))
+                    continue;
+                var props = nic.GetIPProperties();
+                bool gateway = false;
+                foreach (var hop in props.GatewayAddresses)
+                {
+                    if (hop.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    if (IPAddress.IsLoopback(hop.Address) || hop.Address.Equals(IPAddress.Any)) continue;
+                    gateway = true;
+                }
+                foreach (var addr in props.UnicastAddresses)
+                {
+                    if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    if (IPAddress.IsLoopback(addr.Address)) continue;
+                    if (gateway) return addr.Address;
+                    if (fallback == null) fallback = addr.Address;
+                }
+            }
+            return fallback;
+        }
+
+        void Loop()
+        {
+            while (!_stop)
+            {
+                TcpClient client;
+                try { client = _listener.AcceptTcpClient(); }
+                catch { if (_stop) break; continue; }
+                ThreadPool.QueueUserWorkItem(Serve, client);
+            }
+        }
+
+        void Serve(object state)
+        {
+            var client = (TcpClient)state;
+            try
+            {
+                client.ReceiveTimeout = 8000;
+                client.SendTimeout = 8000;
+                using (client)
+                using (var stream = client.GetStream())
+                {
+                    byte[] body;
+                    if (!ReadBody(stream, out body))
+                    {
+                        Write(stream, "400");
+                        return;
+                    }
+                    Bitmap bmp;
+                    try
+                    {
+                        using (var ms = new MemoryStream(body))
+                        using (var img = Image.FromStream(ms))
+                            bmp = new Bitmap(img);
+                    }
+                    catch
+                    {
+                        Write(stream, "400");
+                        return;
+                    }
+                    _gate.BeginInvoke(new Action(delegate { _capture.AcceptPhoneImage(bmp); }));
+                    Write(stream, "200");
+                }
+            }
+            catch { try { client.Close(); } catch { } }
+        }
+
+        static bool ReadBody(NetworkStream stream, out byte[] body)
+        {
+            body = null;
+            var header = new MemoryStream();
+            var one = new byte[1];
+            while (header.Length < 16384)
+            {
+                if (stream.Read(one, 0, 1) != 1) return false;
+                header.WriteByte(one[0]);
+                if (header.Length >= 4)
+                {
+                    var buf = header.GetBuffer();
+                    int n = (int)header.Length;
+                    if (buf[n - 4] == '\r' && buf[n - 3] == '\n' && buf[n - 2] == '\r' && buf[n - 1] == '\n')
+                        break;
+                }
+            }
+            var text = Encoding.ASCII.GetString(header.GetBuffer(), 0, (int)header.Length);
+            if (text.StartsWith("GET ", StringComparison.OrdinalIgnoreCase))
+            {
+                body = new byte[0];
+                return false;
+            }
+            int length = 0;
+            var lines = text.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(lines[i].Substring(15).Trim(), out length);
+                }
+            }
+            if (length <= 0 || length > MaxBytes) return false;
+            body = new byte[length];
+            int got = 0;
+            while (got < length)
+            {
+                int read = stream.Read(body, got, length - got);
+                if (read <= 0) return false;
+                got += read;
+            }
+            return true;
+        }
+
+        static void Write(NetworkStream stream, string code)
+        {
+            var payload = code == "200" ? "ok" : "no";
+            var text = "HTTP/1.1 " + code + " OK\r\nContent-Length: " + payload.Length + "\r\nConnection: close\r\n\r\n" + payload;
+            var bytes = Encoding.ASCII.GetBytes(text);
+            stream.Write(bytes, 0, bytes.Length);
+        }
+
+        public void Dispose()
+        {
+            _stop = true;
+            try { _listener.Stop(); } catch { }
+            try { _gate.Dispose(); } catch { }
         }
     }
 
@@ -423,6 +615,18 @@ namespace Screener
                 catch { Fail(); }
             };
             timer.Start();
+        }
+
+        public void AcceptPhoneImage(Bitmap bmp)
+        {
+            try
+            {
+                PutClipboard(bmp);
+                _icon.BalloonTipTitle = "Screener";
+                _icon.BalloonTipText = "Скрин с телефона в буфере";
+                _icon.ShowBalloonTip(1500);
+            }
+            catch { Fail(); }
         }
 
         void PutClipboard(Bitmap bmp)
