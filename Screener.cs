@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -342,6 +343,7 @@ namespace Screener
         bool _drawing;
         bool _drawCommit;
         bool _penDown;
+        readonly List<Point> _penPts = new List<Point>();
         DrawPad _pad;
         Point _a;
         Point _b;
@@ -391,13 +393,17 @@ namespace Screener
                         if (!_penDown)
                             _frame.Raise();
                         _penDown = true;
-                        _pad.StrokeScreen(p);
                     }
                     else
-                    {
                         _penDown = false;
-                        _pad.Lift();
+                    if (_penPts.Count > 0)
+                    {
+                        var batch = _penPts.ToArray();
+                        _penPts.Clear();
+                        _pad.StrokeScreens(batch);
                     }
+                    if (!Native.IsDown(VkLButton))
+                        _pad.Lift();
                 }
                 bool held = _paste ? edit : chord;
                 if (_cancel)
@@ -473,6 +479,7 @@ namespace Screener
                 _paste = true;
                 _drawCommit = false;
                 _penDown = false;
+                _penPts.Clear();
                 _cancel = false;
                 _pad = new DrawPad();
                 _pad.Open(bmp, Inner(rect));
@@ -492,9 +499,10 @@ namespace Screener
             }
             catch
             {
-                _drawing = false;
-                _paste = false;
-                if (_pad != null)
+                    _drawing = false;
+                    _paste = false;
+                    _penPts.Clear();
+                    if (_pad != null)
                 {
                     try { _pad.Dispose(); } catch { }
                     _pad = null;
@@ -549,6 +557,7 @@ namespace Screener
             {
                 _drawing = true;
                 _drawCommit = false;
+                _penPts.Clear();
                 OpenDrawSoon(rect);
                 return;
             }
@@ -587,6 +596,7 @@ namespace Screener
                 {
                     _drawing = false;
                     _drawCommit = false;
+                    _penPts.Clear();
                     try { _frame.HideFrame(); } catch { }
                     Fail();
                 }
@@ -600,6 +610,7 @@ namespace Screener
             _paste = false;
             _drawCommit = false;
             _cancel = false;
+            _penPts.Clear();
             _frame.HideFrame();
             Bitmap bmp = null;
             if (_pad != null)
@@ -621,6 +632,7 @@ namespace Screener
             _button = false;
             _drawing = false;
             _paste = false;
+            _penPts.Clear();
             try { _frame.HideFrame(); } catch { }
             if (_pad != null)
             {
@@ -638,6 +650,9 @@ namespace Screener
                     int msg = wParam.ToInt32();
                     var info = (Native.MsLl)Marshal.PtrToStructure(lParam, typeof(Native.MsLl));
                     var pt = new Point(info.pt.X, info.pt.Y);
+                    if (_drawing && _pad != null && (msg == WmLButtonDown || msg == WmLButtonUp
+                        || (msg == WmMouseMove && Native.IsDown(VkLButton))))
+                        _penPts.Add(pt);
                     if (!_tracking)
                     {
                         if (!_drawing && msg == WmLButtonDown && Native.IsDown(VkControl) && Native.IsDown(VkShift))
@@ -764,10 +779,16 @@ namespace Screener
     internal sealed class DrawPad : Form
     {
         Bitmap _bmp;
-        Point _last;
+        Bitmap _view;
+        PointF _lastBmp;
+        PointF _lastView;
         bool _down;
-        float _map = 1f;
+        float _sx = 1f;
+        float _sy = 1f;
+        int _vw = 1;
+        int _vh = 1;
         readonly Pen _pen = new Pen(Color.Red, 3f);
+        readonly Pen _viewPen = new Pen(Color.Red, 3f);
 
         public DrawPad()
         {
@@ -780,6 +801,9 @@ namespace Screener
             _pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
             _pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
             _pen.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
+            _viewPen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+            _viewPen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+            _viewPen.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
         }
 
         protected override bool ShowWithoutActivation
@@ -817,38 +841,89 @@ namespace Screener
         public void Open(Bitmap bmp, Rectangle screen)
         {
             _bmp = bmp;
-            _map = screen.Width > 0 ? bmp.Width / (float)screen.Width : 1f;
-            if (_map < 0.01f) _map = 1f;
-            _pen.Width = 3f * _map;
+            _down = false;
             Bounds = screen;
             Show();
             Native.SetWindowPos(Handle, new IntPtr(-1), screen.X, screen.Y, screen.Width, screen.Height, 0x0010 | 0x0040);
+            _vw = ClientSize.Width;
+            _vh = ClientSize.Height;
+            if (_vw < 1 || _vh < 1)
+            {
+                _vw = Math.Max(1, screen.Width);
+                _vh = Math.Max(1, screen.Height);
+            }
+            _sx = bmp.Width / (float)_vw;
+            _sy = bmp.Height / (float)_vh;
+            if (_sx < 0.01f) _sx = 1f;
+            if (_sy < 0.01f) _sy = 1f;
+            _pen.Width = Math.Max(1f, 3f * Math.Max(_sx, _sy));
+            _viewPen.Width = 3f;
+            if (_view != null) _view.Dispose();
+            _view = new Bitmap(_vw, _vh, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(_view))
+            {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.DrawImage(_bmp, 0, 0, _vw, _vh);
+            }
             Invalidate();
         }
 
-        Point Map(Point local)
+        public void StrokeScreens(Point[] screenPts)
         {
-            int x = (int)(local.X * _map);
-            int y = (int)(local.Y * _map);
-            if (x < 0) x = 0;
-            if (y < 0) y = 0;
-            if (_bmp != null && x >= _bmp.Width) x = _bmp.Width - 1;
-            if (_bmp != null && y >= _bmp.Height) y = _bmp.Height - 1;
-            return new Point(x, y);
+            if (_bmp == null || _view == null || screenPts == null || screenPts.Length == 0 || !IsHandleCreated)
+                return;
+            int l = int.MaxValue, t = int.MaxValue, r = int.MinValue, btm = int.MinValue;
+            using (var gb = Graphics.FromImage(_bmp))
+            using (var gv = Graphics.FromImage(_view))
+            {
+                gb.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                gv.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                gb.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                gv.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                for (int i = 0; i < screenPts.Length; i++)
+                {
+                    var wp = new Native.WinPoint();
+                    wp.X = screenPts[i].X;
+                    wp.Y = screenPts[i].Y;
+                    Native.ScreenToClient(Handle, ref wp);
+                    float x = wp.X;
+                    float y = wp.Y;
+                    if (x < 0 || y < 0 || x >= _vw || y >= _vh)
+                    {
+                        _down = false;
+                        continue;
+                    }
+                    var bp = new PointF(x * _sx, y * _sy);
+                    var vp = new PointF(x, y);
+                    if (!_down)
+                    {
+                        _down = true;
+                        _lastBmp = bp;
+                        _lastView = vp;
+                    }
+                    gb.DrawLine(_pen, _lastBmp, bp);
+                    gv.DrawLine(_viewPen, _lastView, vp);
+                    Expand(ref l, ref t, ref r, ref btm, _lastView, vp);
+                    _lastBmp = bp;
+                    _lastView = vp;
+                }
+            }
+            if (l < r && t < btm)
+                Invalidate(Rectangle.FromLTRB(l, t, r, btm));
         }
 
-        public void StrokeScreen(Point screen)
+        static void Expand(ref int l, ref int t, ref int r, ref int b, PointF a, PointF c)
         {
-            var local = new Point(screen.X - Left, screen.Y - Top);
-            if (_bmp == null || local.X < 0 || local.Y < 0 || local.X >= Width || local.Y >= Height) return;
-            var p = Map(local);
-            if (!_down)
-            {
-                _down = true;
-                _last = p;
-            }
-            Stroke(_last, p);
-            _last = p;
+            const int pad = 6;
+            int x0 = (int)Math.Floor(Math.Min(a.X, c.X)) - pad;
+            int y0 = (int)Math.Floor(Math.Min(a.Y, c.Y)) - pad;
+            int x1 = (int)Math.Ceiling(Math.Max(a.X, c.X)) + pad;
+            int y1 = (int)Math.Ceiling(Math.Max(a.Y, c.Y)) + pad;
+            if (x0 < l) l = x0;
+            if (y0 < t) t = y0;
+            if (x1 > r) r = x1;
+            if (y1 > b) b = y1;
         }
 
         public void Lift()
@@ -864,48 +939,20 @@ namespace Screener
             return bmp;
         }
 
-        protected override void OnMouseDown(MouseEventArgs e)
+        protected override void OnPaintBackground(PaintEventArgs e)
         {
-            if (e.Button != MouseButtons.Left || _bmp == null) return;
-            _down = true;
-            _last = Map(e.Location);
-            Stroke(_last, _last);
-        }
-
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            if (!_down || _bmp == null) return;
-            var p = Map(e.Location);
-            Stroke(_last, p);
-            _last = p;
-        }
-
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            _down = false;
-        }
-
-        void Stroke(Point a, Point b)
-        {
-            using (var g = Graphics.FromImage(_bmp))
-            {
-                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                g.DrawLine(_pen, a, b);
-            }
-            float inv = _map > 0f ? 1f / _map : 1f;
-            int pad = (int)(4f * inv) + 2;
-            int l = (int)(Math.Min(a.X, b.X) * inv) - pad;
-            int t = (int)(Math.Min(a.Y, b.Y) * inv) - pad;
-            int r = (int)(Math.Max(a.X, b.X) * inv) + pad;
-            int bt = (int)(Math.Max(a.Y, b.Y) * inv) + pad;
-            Invalidate(Rectangle.FromLTRB(l, t, r, bt));
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            if (_bmp == null) return;
-            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            e.Graphics.DrawImage(_bmp, ClientRectangle);
+            if (_view == null) return;
+            var d = e.ClipRectangle;
+            if (d.Width < 1 || d.Height < 1) return;
+            var g = e.Graphics;
+            g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+            g.DrawImage(_view, d, d.X, d.Y, d.Width, d.Height, GraphicsUnit.Pixel);
         }
 
         protected override void Dispose(bool disposing)
@@ -913,7 +960,9 @@ namespace Screener
             if (disposing)
             {
                 _pen.Dispose();
+                _viewPen.Dispose();
                 if (_bmp != null) _bmp.Dispose();
+                if (_view != null) _view.Dispose();
             }
             base.Dispose(disposing);
         }
@@ -1180,6 +1229,9 @@ namespace Screener
             }
             return _penCursor;
         }
+
+        [DllImport("user32.dll")]
+        public static extern bool ScreenToClient(IntPtr hWnd, ref WinPoint lpPoint);
 
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
