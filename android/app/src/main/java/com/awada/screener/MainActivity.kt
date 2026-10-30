@@ -12,16 +12,26 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.awada.screener.ui.theme.ScreenerTheme
@@ -76,7 +86,16 @@ class MainActivity : ComponentActivity() {
                         Button(onClick = { onPrimary() }) {
                             Text(if (on) "Убрать кнопку" else "Показать кнопку")
                         }
-                        Text("Один раз разрешите кнопку поверх окон и съёмку экрана. Потом жмите красный кружок на любом экране.")
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                "Один раз разрешите кнопку поверх окон и съёмку экрана. Потом на любом экране жмите",
+                                modifier = Modifier.weight(1f)
+                            )
+                            HelpButton()
+                        }
                     }
                 }
             }
@@ -124,6 +143,25 @@ class MainActivity : ComponentActivity() {
             mgr.createScreenCaptureIntent()
         }
         projectionLauncher.launch(capture)
+    }
+
+    @Composable
+    private fun HelpButton() {
+        val gray = Color(0xFF757575)
+        Canvas(Modifier.size(56.dp)) {
+            val stroke = Stroke(width = 1.7.dp.toPx())
+            val inset = stroke.width / 2f + 1f
+            drawCircle(
+                color = gray,
+                radius = size.minDimension / 2f - inset,
+                style = stroke
+            )
+            val u = size.width / 24f
+            val corner = CornerRadius(u * 1.2f, u * 1.2f)
+            val sheet = Size(9.2f * u, 9.2f * u)
+            drawRoundRect(gray, Offset(9.2f * u, 5.6f * u), sheet, corner, style = stroke)
+            drawRoundRect(gray, Offset(5.6f * u, 9.2f * u), sheet, corner, style = stroke)
+        }
     }
 
     companion object {
