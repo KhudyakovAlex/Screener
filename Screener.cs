@@ -322,6 +322,7 @@ namespace Screener
         const int VkLButton = 0x01;
         const int VkShift = 0x10;
         const int VkControl = 0x11;
+        const int VkMenu = 0x12;
         const int VkEscape = 0x1B;
 
         readonly NotifyIcon _icon;
@@ -334,7 +335,8 @@ namespace Screener
         IntPtr _cross;
         bool _tracking;
         bool _button;
-        bool _chordDown;
+        bool _editDown;
+        bool _paste;
         bool _brokeChord;
         bool _cancel;
         bool _drawing;
@@ -375,6 +377,7 @@ namespace Screener
         {
             if (_disposed) return;
             bool chord = Native.IsDown(VkControl) && Native.IsDown(VkShift);
+            bool edit = Native.IsDown(VkControl) && Native.IsDown(VkMenu);
             var p = Cursor.Position;
             if (Native.IsDown(VkEscape))
                 _cancel = true;
@@ -396,25 +399,26 @@ namespace Screener
                         _pad.Lift();
                     }
                 }
+                bool held = _paste ? edit : chord;
                 if (_cancel)
                     EndDraw(false);
-                else if (!chord && _pad != null)
+                else if (!held && _pad != null)
                     EndDraw(true);
-                else if (!chord)
+                else if (!held)
                     _drawCommit = true;
                 return;
             }
 
             if (!_tracking)
             {
-                if (chord && !_chordDown)
+                if (edit && !_editDown)
                 {
-                    _chordDown = true;
+                    _editDown = true;
                     if (OpenClipboardDraw())
                         return;
                 }
                 else
-                    _chordDown = chord;
+                    _editDown = edit;
 
                 if (!_drawing && chord && Native.IsDown(VkLButton))
                 {
@@ -466,19 +470,30 @@ namespace Screener
                 Native.Tap(0x87);
                 var rect = Fit(bmp);
                 _drawing = true;
+                _paste = true;
                 _drawCommit = false;
                 _penDown = false;
                 _cancel = false;
                 _pad = new DrawPad();
-                _pad.Open(bmp, rect);
+                _pad.Open(bmp, Inner(rect));
                 bmp = null;
                 _frame.ShowSelection(rect);
                 _frame.Raise();
+                var raise = new System.Windows.Forms.Timer();
+                raise.Interval = 40;
+                raise.Tick += delegate
+                {
+                    raise.Stop();
+                    raise.Dispose();
+                    if (!_disposed && _drawing) _frame.Raise();
+                };
+                raise.Start();
                 return true;
             }
             catch
             {
                 _drawing = false;
+                _paste = false;
                 if (_pad != null)
                 {
                     try { _pad.Dispose(); } catch { }
@@ -489,6 +504,13 @@ namespace Screener
                 try { _frame.HideFrame(); } catch { }
                 return false;
             }
+        }
+
+        static Rectangle Inner(Rectangle rect)
+        {
+            if (rect.Width < 12 || rect.Height < 12) return rect;
+            rect.Inflate(-3, -3);
+            return rect;
         }
 
         static Rectangle Fit(Bitmap bmp)
@@ -557,7 +579,7 @@ namespace Screener
                         return;
                     }
                     _pad = new DrawPad();
-                    _pad.Open(bmp, rect);
+                    _pad.Open(bmp, Inner(rect));
                     _frame.ShowSelection(rect);
                     _frame.Raise();
                 }
@@ -575,6 +597,7 @@ namespace Screener
         void EndDraw(bool copy)
         {
             _drawing = false;
+            _paste = false;
             _drawCommit = false;
             _cancel = false;
             _frame.HideFrame();
@@ -597,6 +620,7 @@ namespace Screener
             _tracking = false;
             _button = false;
             _drawing = false;
+            _paste = false;
             try { _frame.HideFrame(); } catch { }
             if (_pad != null)
             {
@@ -1013,6 +1037,7 @@ namespace Screener
                 if (_place.Equals(place) && _shown)
                     return;
                 _place = place;
+                Native.ShowWindow(handle, 8);
                 Native.SetWindowPos(handle, new IntPtr(-1), x, y, w, h, 0x0010 | 0x0040);
                 _shown = true;
             }
