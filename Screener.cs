@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -246,6 +247,37 @@ namespace Screener
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Выход", null, delegate { ExitThread(); });
             _icon.ContextMenuStrip = menu;
+            Application.Idle += Ready;
+        }
+
+        void Ready(object sender, EventArgs e)
+        {
+            Application.Idle -= Ready;
+            bool turnedOn = false;
+            if (!AutoStart.IsEnabled())
+            {
+                AutoStart.Set(true);
+                _autoStart.Checked = AutoStart.IsEnabled();
+                turnedOn = _autoStart.Checked;
+            }
+            if (Firewall.Exists())
+            {
+                if (!turnedOn) return;
+                _icon.BalloonTipTitle = "Screener";
+                _icon.BalloonTipText = "Запуск вместе с Windows включён";
+                _icon.ShowBalloonTip(2000);
+                return;
+            }
+            string text = turnedOn
+                ? "Программа будет запускаться вместе с Windows.\n\nЧтобы скрин с телефона попал в буфер, нажмите «Да» и подтвердите запрос Windows. Это разрешит входящие подключения на порт 47123."
+                : "Чтобы скрин с телефона попал в буфер, нажмите «Да» и подтвердите запрос Windows. Это разрешит входящие подключения на порт 47123.";
+            if (MessageBox.Show(text, "Screener", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
+            {
+                MessageBox.Show("Телефон не пришлёт скрин, пока порт 47123 закрыт.\nЗапустите Screener ещё раз и нажмите «Да».", "Screener");
+                return;
+            }
+            if (!Firewall.Allow() || !Firewall.Exists())
+                MessageBox.Show("Разрешение не включилось.\nЗапустите Screener ещё раз и подтвердите запрос Windows.", "Screener");
         }
 
         void Ask(bool cut)
@@ -492,6 +524,45 @@ namespace Screener
                     key.SetValue(Name, "\"" + Application.ExecutablePath + "\"");
                 else
                     key.DeleteValue(Name, false);
+            }
+        }
+    }
+
+    internal static class Firewall
+    {
+        const string Rule = "Screener 47123";
+
+        public static bool Exists()
+        {
+            return Run("advfirewall firewall show rule name=\"" + Rule + "\"", false) == 0;
+        }
+
+        public static bool Allow()
+        {
+            return Run("advfirewall firewall add rule name=\"" + Rule + "\" dir=in action=allow protocol=TCP localport=47123 profile=any", true) == 0;
+        }
+
+        static int Run(string arguments, bool elevate)
+        {
+            try
+            {
+                var info = new ProcessStartInfo();
+                info.FileName = "netsh";
+                info.Arguments = arguments;
+                info.CreateNoWindow = true;
+                info.WindowStyle = ProcessWindowStyle.Hidden;
+                info.UseShellExecute = elevate;
+                if (elevate) info.Verb = "runas";
+                using (var process = Process.Start(info))
+                {
+                    if (process == null) return -1;
+                    if (!process.WaitForExit(20000)) return -1;
+                    return process.ExitCode;
+                }
+            }
+            catch
+            {
+                return -1;
             }
         }
     }

@@ -19,10 +19,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
@@ -32,6 +35,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.awada.screener.ui.theme.ScreenerTheme
@@ -39,6 +43,7 @@ import com.awada.screener.ui.theme.ScreenerTheme
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { getSharedPreferences("screener", MODE_PRIVATE) }
     private val ipState = mutableStateOf(DEFAULT_IP)
+    private val historyState = mutableStateOf(listOf<String>())
     private val running = mutableStateOf(false)
 
     private val notifyPermission = registerForActivityResult(
@@ -64,8 +69,10 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val saved = prefs.getString(KEY_IP, DEFAULT_IP) ?: DEFAULT_IP
         ipState.value = if (saved == OLD_IP) DEFAULT_IP else saved
+        historyState.value = loadHistory(ipState.value)
         setContent {
             val ip = ipState.value
+            val history = historyState.value.filter { it != ip.trim() }
             val on = running.value
             ScreenerTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
@@ -81,8 +88,16 @@ class MainActivity : ComponentActivity() {
                             value = ip,
                             onValueChange = { ipState.value = it },
                             label = { Text("IP компьютера") },
-                            singleLine = true
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { useHost(ip) })
                         )
+                        if (history.isNotEmpty()) {
+                            Text("Недавние")
+                            history.forEach { savedIp ->
+                                TextButton(onClick = { useHost(savedIp) }) { Text(savedIp) }
+                            }
+                        }
                         Button(onClick = { onPrimary() }) {
                             Text(if (on) "Убрать кнопку" else "Показать кнопку")
                         }
@@ -107,10 +122,37 @@ class MainActivity : ComponentActivity() {
         running.value = ShotService.running
     }
 
+    private fun loadHistory(current: String): List<String> {
+        val saved = prefs.getString(KEY_IPS, null)
+            ?.split('\n')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() && it != OLD_IP }
+            ?.distinct()
+            ?.toMutableList()
+            ?: mutableListOf()
+        if (current.isNotEmpty() && current !in saved) saved.add(0, current)
+        val kept = saved.take(8)
+        prefs.edit().putString(KEY_IPS, kept.joinToString("\n")).apply()
+        return kept
+    }
+
+    private fun useHost(host: String) {
+        val clean = host.trim().ifEmpty { return }
+        ipState.value = clean
+        val kept = (listOf(clean) + historyState.value.filter { it != clean }).take(8)
+        historyState.value = kept
+        prefs.edit()
+            .putString(KEY_IP, clean)
+            .putString(KEY_IPS, kept.joinToString("\n"))
+            .apply()
+        if (ShotService.running) {
+            startService(Intent(this, ShotService::class.java).putExtra(ShotService.EXTRA_HOST, clean))
+        }
+    }
+
     private fun onPrimary() {
         val host = ipState.value.trim().ifEmpty { DEFAULT_IP }
-        ipState.value = host
-        prefs.edit().putString(KEY_IP, host).apply()
+        useHost(host)
         if (ShotService.running) {
             startService(Intent(this, ShotService::class.java).setAction(ShotService.ACTION_STOP))
             running.value = false
@@ -168,5 +210,6 @@ class MainActivity : ComponentActivity() {
         const val DEFAULT_IP = "10.205.0.95"
         private const val OLD_IP = "192.168.1.170"
         private const val KEY_IP = "ip"
+        private const val KEY_IPS = "ips"
     }
 }
