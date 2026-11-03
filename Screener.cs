@@ -55,19 +55,172 @@ namespace Screener
         }
     }
 
+    internal static class Hotkeys
+    {
+        public const int Ctrl = 1;
+        public const int Shift = 2;
+        public const int Alt = 4;
+
+        public static int Cut = Ctrl | Shift;
+        public static int Draw = Ctrl | Alt;
+        public static bool Paused;
+
+        public static void Load()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Screener"))
+                {
+                    if (key == null) return;
+                    Cut = Read(key, "cut", Ctrl | Shift);
+                    Draw = Read(key, "draw", Ctrl | Alt);
+                }
+            }
+            catch { }
+        }
+
+        public static void Save()
+        {
+            using (var key = Registry.CurrentUser.CreateSubKey(@"Software\Screener"))
+            {
+                if (key == null) return;
+                key.SetValue("cut", Cut, RegistryValueKind.DWord);
+                key.SetValue("draw", Draw, RegistryValueKind.DWord);
+            }
+        }
+
+        public static bool CutHeld()
+        {
+            return !Paused && Match(Cut);
+        }
+
+        public static bool DrawHeld()
+        {
+            return !Paused && Match(Draw);
+        }
+
+        public static int Down()
+        {
+            int mask = 0;
+            if (Native.IsDown(0x11) || Native.IsDown(0xA2) || Native.IsDown(0xA3)) mask |= Ctrl;
+            if (Native.IsDown(0x10) || Native.IsDown(0xA0) || Native.IsDown(0xA1)) mask |= Shift;
+            if (Native.IsDown(0x12) || Native.IsDown(0xA4) || Native.IsDown(0xA5)) mask |= Alt;
+            return mask;
+        }
+
+        public static string Format(int mask)
+        {
+            var parts = new System.Collections.Generic.List<string>();
+            if ((mask & Ctrl) != 0) parts.Add("Ctrl");
+            if ((mask & Shift) != 0) parts.Add("Shift");
+            if ((mask & Alt) != 0) parts.Add("Alt");
+            if (parts.Count == 0) return "не задано";
+            return string.Join("+", parts.ToArray());
+        }
+
+        static int Read(RegistryKey key, string name, int fallback)
+        {
+            object value = key.GetValue(name);
+            if (value == null) return fallback;
+            int mask = Convert.ToInt32(value) & 7;
+            return mask == 0 ? fallback : mask;
+        }
+
+        static bool Match(int mask)
+        {
+            if (mask == 0) return false;
+            return Down() == mask;
+        }
+    }
+
+    internal sealed class HotkeyDialog : Form
+    {
+        readonly Label _keys;
+        readonly System.Windows.Forms.Timer _timer;
+        readonly int _busy;
+        int _mask;
+
+        public int Mask { get { return _mask; } }
+
+        public HotkeyDialog(string title, int busy)
+        {
+            _busy = busy;
+            Text = title;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            TopMost = true;
+            ClientSize = new Size(360, 150);
+            var hint = new Label();
+            hint.Text = "Зажмите клавиши и нажмите ОК";
+            hint.SetBounds(16, 16, 328, 24);
+            _keys = new Label();
+            _keys.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 14f, FontStyle.Bold);
+            _keys.SetBounds(16, 48, 328, 32);
+            _keys.Text = "не задано";
+            var ok = new Button();
+            ok.Text = "ОК";
+            ok.SetBounds(160, 104, 80, 28);
+            ok.Click += delegate { Accept(); };
+            var cancel = new Button();
+            cancel.Text = "Отмена";
+            cancel.SetBounds(252, 104, 80, 28);
+            cancel.DialogResult = DialogResult.Cancel;
+            CancelButton = cancel;
+            Controls.Add(hint);
+            Controls.Add(_keys);
+            Controls.Add(ok);
+            Controls.Add(cancel);
+            _timer = new System.Windows.Forms.Timer();
+            _timer.Interval = 40;
+            _timer.Tick += delegate { Read(); };
+            _timer.Start();
+        }
+
+        void Read()
+        {
+            _mask = Hotkeys.Down();
+            _keys.Text = _mask == _busy ? "Уже занято" : Hotkeys.Format(_mask);
+        }
+
+        void Accept()
+        {
+            if (_mask == 0 || _mask == _busy) return;
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            _timer.Stop();
+            _timer.Dispose();
+            base.OnFormClosed(e);
+        }
+    }
+
     internal sealed class TrayApp : ApplicationContext
     {
         readonly NotifyIcon _icon;
         readonly CaptureController _capture;
         readonly PhoneInbox _phone;
         readonly ToolStripMenuItem _autoStart;
+        readonly ToolStripMenuItem _cutItem;
+        readonly ToolStripMenuItem _drawItem;
 
         public TrayApp()
         {
             _icon = new NotifyIcon();
             _icon.Icon = AppIcon.Create();
-            _icon.Text = "Screener: Ctrl+Shift и протяните мышь";
             _icon.Visible = true;
+
+            Hotkeys.Load();
+            _cutItem = new ToolStripMenuItem();
+            _cutItem.Click += delegate { Ask(true); };
+            _drawItem = new ToolStripMenuItem();
+            _drawItem.Click += delegate { Ask(false); };
+            RefreshKeys();
 
             _autoStart = new ToolStripMenuItem("Запускать с Windows");
             _autoStart.Checked = AutoStart.IsEnabled();
@@ -85,11 +238,44 @@ namespace Screener
             };
 
             var menu = new ContextMenuStrip();
+            menu.Items.Add(_cutItem);
+            menu.Items.Add(_drawItem);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(address);
             menu.Items.Add(_autoStart);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Выход", null, delegate { ExitThread(); });
             _icon.ContextMenuStrip = menu;
+        }
+
+        void Ask(bool cut)
+        {
+            Hotkeys.Paused = true;
+            try
+            {
+                string title = cut ? "Вырезать кусок с экрана" : "Нарисовать на картинке из буфера";
+                int busy = cut ? Hotkeys.Draw : Hotkeys.Cut;
+                using (var dlg = new HotkeyDialog(title, busy))
+                {
+                    if (dlg.ShowDialog() != DialogResult.OK) return;
+                    if (cut) Hotkeys.Cut = dlg.Mask;
+                    else Hotkeys.Draw = dlg.Mask;
+                    Hotkeys.Save();
+                    RefreshKeys();
+                }
+            }
+            finally
+            {
+                Hotkeys.Paused = false;
+            }
+        }
+
+        void RefreshKeys()
+        {
+            _cutItem.Text = "Вырезать кусок с экрана: " + Hotkeys.Format(Hotkeys.Cut);
+            _drawItem.Text = "Нарисовать на картинке из буфера: " + Hotkeys.Format(Hotkeys.Draw);
+            string tip = "Вырезать " + Hotkeys.Format(Hotkeys.Cut) + ", буфер " + Hotkeys.Format(Hotkeys.Draw);
+            _icon.Text = tip.Length <= 63 ? tip : tip.Substring(0, 63);
         }
 
         void ToggleAutoStart()
@@ -378,8 +564,8 @@ namespace Screener
         void Poll()
         {
             if (_disposed) return;
-            bool chord = Native.IsDown(VkControl) && Native.IsDown(VkShift);
-            bool edit = Native.IsDown(VkControl) && Native.IsDown(VkMenu);
+            bool chord = Hotkeys.CutHeld();
+            bool edit = Hotkeys.DrawHeld();
             var p = Cursor.Position;
             if (Native.IsDown(VkEscape))
                 _cancel = true;
@@ -550,7 +736,7 @@ namespace Screener
             _button = false;
             _cancel = false;
             bool draw = copy && rect.Width >= 2 && rect.Height >= 2
-                && Native.IsDown(VkControl) && Native.IsDown(VkShift);
+                && Hotkeys.CutHeld();
             if (!draw)
                 _frame.HideFrame();
             if (draw)
@@ -579,7 +765,7 @@ namespace Screener
                     try { Native.DwmFlush(); } catch { }
                     var bmp = ScreenGrab.Grab(rect);
                     if (bmp == null) throw new InvalidOperationException();
-                    if (_drawCommit || !Native.IsDown(VkControl) || !Native.IsDown(VkShift))
+                    if (_drawCommit || !Hotkeys.CutHeld())
                     {
                         _frame.HideFrame();
                         PutClipboard(bmp);
@@ -655,7 +841,7 @@ namespace Screener
                         _penPts.Add(pt);
                     if (!_tracking)
                     {
-                        if (!_drawing && msg == WmLButtonDown && Native.IsDown(VkControl) && Native.IsDown(VkShift))
+                        if (!_drawing && msg == WmLButtonDown && Hotkeys.CutHeld())
                         {
                             Arm(pt);
                             _button = true;
